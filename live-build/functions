@@ -1,0 +1,691 @@
+# vi: ts=4 expandtab syntax=sh
+
+# default imagesize = 2252*1024**2 = 2.2G (the current size we ship)
+imagesize=${IMAGE_SIZE:-2361393152}
+fs_label="${FS_LABEL:-rootfs}"
+
+rootfs_dev_mapper=
+loop_device=
+loop_raw=
+backing_img=
+
+clean_loops() {
+    local kpartx_ret
+    local kpartx_stdout
+
+    if [ -n "${backing_img}" ]; then
+        # sync before removing loop to avoid "Device or resource busy" errors
+        sync
+        kpartx_ret=""
+        kpartx_stdout=$(kpartx -v -d "${backing_img}") || kpartx_ret=$?
+        echo "$kpartx_stdout"
+        if [ -n "$kpartx_ret" ]; then
+            if echo "$kpartx_stdout" | grep -q "loop deleted"; then
+                echo "Suppressing kpartx returning error (#860894)"
+            else
+                exit $kpartx_ret
+            fi
+        fi
+        unset backing_img
+    fi
+
+    if [ -z "${rootfs_dev_mapper}" ]; then
+        return 0
+    fi
+
+    unset loop_device
+    unset loop_raw
+    unset rootfs_dev_mapper
+}
+
+create_empty_disk_image() {
+    # Prepare an empty disk image
+    dd if=/dev/zero of="$1" bs=1 count=0 seek="${imagesize}"
+}
+
+create_manifest() {
+    local chroot_root=${1}
+    local target_file=${2}
+    echo "create_manifest chroot_root: ${chroot_root}"
+    dpkg-query --show --admindir="${chroot_root}/var/lib/dpkg" > ${target_file}
+    echo "create_manifest call to dpkg-query finished."
+    ./config/snap-seed-parse "${chroot_root}" "${target_file}"
+    echo "create_manifest call to snap_seed_parse finished."
+    echo "create_manifest finished"
+}
+
+make_ext4_partition() {
+    device="$1"
+    label=${fs_label:+-L "${fs_label}"}
+    mkfs.ext4 -F -b 4096 -i 8192 -m 0 ${label} -E resize=536870912 "$device"
+}
+
+mount_image() {
+    trap clean_loops EXIT
+    backing_img="$1"
+    local rootpart="$2"
+    kpartx_mapping="$(kpartx -s -v -a ${backing_img})"
+
+    # Find the loop device
+    loop_p1="$(echo -e ${kpartx_mapping} | head -n1 | awk '{print$3}')"
+    loop_device="/dev/${loop_p1%p[0-9]*}"
+    if [ ! -b ${loop_device} ]; then
+        echo "unable to find loop device for ${backing_img}"
+        exit 1
+    fi
+
+    # Find the rootfs location
+    rootfs_dev_mapper="/dev/mapper/${loop_p1%%[0-9]}${rootpart}"
+    if [ ! -b "${rootfs_dev_mapper}" ]; then
+        echo "${rootfs_dev_mapper} is not a block device";
+        exit 1
+    fi
+
+    # Add some information to the debug logs
+    echo "Mounted disk image ${backing_img} to ${rootfs_dev_mapper}"
+    blkid ${rootfs_dev_mapper}
+
+    return 0
+}
+
+setup_mountpoint() {
+    local mountpoint="$1"
+
+    mount --rbind --make-rslave /dev "$mountpoint/dev"
+    mount proc-live -t proc "$mountpoint/proc"
+    mount sysfs-live -t sysfs "$mountpoint/sys"
+    mount -t tmpfs none "$mountpoint/tmp"
+    mount -t tmpfs none "$mountpoint/var/lib/apt/lists"
+    mount -t tmpfs none "$mountpoint/var/cache/apt"
+    mv "$mountpoint/etc/resolv.conf" resolv.conf.tmp
+    cp /etc/resolv.conf "$mountpoint/etc/resolv.conf"
+    chroot "$mountpoint" apt-get update
+
+}
+
+teardown_mountpoint() {
+    # Reverse the operations from setup_mountpoint
+    local mountpoint="$1"
+
+    # ensure we have exactly one trailing slash, and escape all slashes for awk
+    mountpoint_match=$(echo "$mountpoint" | sed -e's,/$,,; s,/,\\/,g;')'\/'
+    # sort -r ensures that deeper mountpoints are unmounted first
+    for submount in $(awk </proc/self/mounts "\$2 ~ /$mountpoint_match/ \
+                      { print \$2 }" | LC_ALL=C sort -r); do
+        umount $submount
+    done
+    mv resolv.conf.tmp "$mountpoint/etc/resolv.conf"
+}
+
+mount_partition() {
+    partition="$1"
+    mountpoint="$2"
+
+    mount "$partition" "$mountpoint"
+    setup_mountpoint "$mountpoint"
+}
+
+mount_overlay() {
+    lower="$1"
+    upper="$2"
+    work="$2/../work"
+    path="$3"
+
+    mkdir -p "$work"
+    mount -t overlay overlay \
+	-olowerdir="$lower",upperdir="$upper",workdir="$work" \
+	"$path"
+}
+
+mount_disk_image() {
+    local disk_image=${1}
+    local mountpoint=${2}
+    mount_image ${disk_image} 1
+    mount_partition "${rootfs_dev_mapper}" $mountpoint
+
+    local uefi_dev="/dev/mapper${loop_device///dev/}p15"
+    if [ -b ${uefi_dev} -a -e $mountpoint/boot/efi ]; then
+        mount "${uefi_dev}" $mountpoint/boot/efi
+    fi
+
+    # This is needed to allow for certain operations
+    # such as updating grub and installing software
+    cat > $mountpoint/usr/sbin/policy-rc.d << EOF
+#!/bin/sh
+# ${IMAGE_STR}
+echo "All runlevel operations denied by policy" >&2
+exit 101
+EOF
+    chmod 0755 $mountpoint/usr/sbin/policy-rc.d
+
+}
+
+umount_partition() {
+    local mountpoint=${1}
+    teardown_mountpoint $mountpoint
+    umount -R $mountpoint
+    udevadm settle
+    # workaround for LP: 1960537
+    sleep 30 
+
+    if [ -n "${rootfs_dev_mapper}" -a -b "${rootfs_dev_mapper}" ]; then
+        # buildd's don't have /etc/mtab symlinked
+        # /etc/mtab is needed in order zerofree space for ext4 filesystems
+        [ -e /etc/mtab ] || ln -s /proc/mounts /etc/mtab
+
+        # both of these are likely overkill, but it does result in slightly
+        # smaller ext4 filesystem
+        e2fsck -y -E discard ${rootfs_dev_mapper}
+        zerofree ${rootfs_dev_mapper}
+    fi
+}
+
+umount_disk_image() {
+    mountpoint="$1"
+
+    local uefi_dev="/dev/mapper${loop_device///dev/}p15"
+    if [ -e "$mountpoint/boot/efi" -a -b "$uefi_dev" ]; then
+	# zero fill free space in UEFI partition
+	cat < /dev/zero > "$mountpoint/boot/efi/bloat_file" 2> /dev/null || true
+	rm "$mountpoint/boot/efi/bloat_file"
+        umount --detach-loop "$mountpoint/boot/efi"
+    fi
+
+    if [ -e $mountpoint/usr/sbin/policy-rc.d ]; then
+        rm $mountpoint/usr/sbin/policy-rc.d
+    fi
+    umount_partition $mountpoint
+    clean_loops
+}
+
+modify_vmdk_header() {
+    # Modify the VMDK headers so that both VirtualBox _and_ VMware can
+    # read the vmdk and import them.
+
+    vmdk_name="${1}"
+    descriptor=$(mktemp)
+    newdescriptor=$(mktemp)
+
+    # Extract the vmdk header for manipulation
+    dd if="${vmdk_name}" of="${descriptor}" bs=1 skip=512 count=1024
+    echo "Cat'ing original vmdk disk descriptor to console for debugging."
+    # cat header so we are aware of the original descriptor for debugging
+    cat $descriptor
+
+    # trim null bytes to treat as standard text file
+    tr -d '\000' < $descriptor > $newdescriptor
+
+    #   remove the vmdk-stream-converter comment and replace with
+    #       # Disk DescriptorFile. This is needed for Virtualbox
+    #   remove the comments from vmdk-stream-converter which causes
+    #       VirtualBox and others to fail VMDK validation
+    sed -i -e 's|# Description file.*|# Disk DescriptorFile|' \
+        -e '/# Believe this is random*/d' \
+        -e '/# Indicates no parent/d' \
+        -e '/# The Disk Data Base/d' \
+            ${newdescriptor}
+
+    # add newline to newdescriptor
+    echo "" >> $newdescriptor
+
+    # add required tools version
+    echo -n 'ddb.toolsVersion = "2147483647"' >> $newdescriptor
+
+    echo "Cat'ing modified descriptor for debugging."
+    cat $newdescriptor
+
+    # diff original descriptor and new descriptor for debugging
+    # diff exits 1 if difference. pipefail not set so piping diff
+    # to cat prints diff and swallows exit 1
+    echo "Printing diff of original and new descriptors."
+    diff --text $descriptor $newdescriptor | cat
+
+    # The header must be 1024 or less before padding
+    if ! expr $(stat --format=%s ${newdescriptor}) \< 1025 > /dev/null 2>&1; then
+        echo "descriptor is too large, VMDK will be invalid!"; 
+        exit 1
+    fi
+
+    # reset newdescriptor to be 1024
+    truncate --no-create --size=1K $newdescriptor
+
+    # Overwrite the vmdk header with our new, modified one
+    dd conv=notrunc,nocreat \
+        if="${newdescriptor}" of="${vmdk_name}" \
+        bs=1 seek=512 count=1024
+
+    rm ${descriptor} ${newdescriptor}
+}
+
+create_vmdk() {
+    # There is no real good way to create a _compressed_ VMDK using open source
+    # tooling that works across multiple VMDK-capable platforms. This functions
+    # uses vmdk-stream-converter and then calls modify_vmdk_header to produce a
+    # compatible VMDK.
+
+    src="$1"
+    destination="$2"
+    size="${3:-10240}"
+
+    streamconverter="VMDKstream"
+    scratch_d=$(mktemp -d)
+    cp ${src} ${scratch_d}/resize.img
+
+    truncate --size=${size}M ${scratch_d}/resize.img
+    python -m ${streamconverter} ${scratch_d}/resize.img ${destination}
+    modify_vmdk_header ${destination}
+
+    qemu-img info ${destination}
+    rm -rf ${scratch_d}
+}
+
+create_derivative() {
+    # arg1 is the disk type
+    # arg2 is the new name
+    unset derivative_img
+    case ${1} in
+           uefi) disk_image="binary/boot/disk-uefi.ext4";
+                 dname="${disk_image//-uefi/-$2-uefi}";;
+              *) disk_image="binary/boot/disk.ext4";
+                 dname="${disk_image//.ext4/-$2.ext4}";;
+    esac
+
+    if [ ! -e ${disk_image} ]; then
+        echo "Did not find ${disk_image}!"; exit 1;
+    fi
+
+    cp ${disk_image} ${dname}
+    export derivative_img=${dname}
+}
+
+convert_to_qcow2() {
+    src="$1"
+    destination="$2"
+    qemu-img convert -c -O qcow2 -o compat=0.10 "$src" "$destination"
+    qemu-img info "$destination"
+}
+
+replace_grub_root_with_label() {
+    # When update-grub is run, it will detect the disks in the build system.
+    # Instead, we want grub to use the right labelled disk
+    CHROOT_ROOT="$1"
+
+    # If boot by partuuid has been requested, don't override.
+    if [ -f $CHROOT_ROOT/etc/default/grub.d/40-force-partuuid.cfg ] && \
+           grep -q ^GRUB_FORCE_PARTUUID= $CHROOT_ROOT/etc/default/grub.d/40-force-partuuid.cfg
+    then
+        return 0
+    fi
+    sed -i -e "s,root=[^ ]*,root=LABEL=${fs_label}," \
+        "$CHROOT_ROOT/boot/grub/grub.cfg"
+}
+
+
+# When running update-grub in a chroot on a build host, we don't want it to
+# probe for disks or probe for other installed OSes.  Extract common
+# diversion wrappers, so this isn't reinvented differently for each image.
+divert_grub() {
+	CHROOT_ROOT="$1"
+
+	chroot "$CHROOT_ROOT" dpkg-divert --local \
+		--rename /usr/sbin/grub-probe
+	chroot "$CHROOT_ROOT" touch /usr/sbin/grub-probe
+	chroot "$CHROOT_ROOT" chmod +x /usr/sbin/grub-probe
+
+	chroot "$CHROOT_ROOT" dpkg-divert --local \
+		--divert /etc/grub.d/30_os-prober.dpkg-divert \
+		--rename /etc/grub.d/30_os-prober
+
+	# Divert systemd-detect-virt; /etc/kernel/postinst.d/zz-update-grub
+	# no-ops if we are in a container, and the launchpad farm runs builds
+	# in lxd.  We therefore pretend that we're never in a container (by
+	# exiting 1).
+	chroot "$CHROOT_ROOT" dpkg-divert --local \
+		--rename /usr/bin/systemd-detect-virt
+	echo "exit 1" > "$CHROOT_ROOT"/usr/bin/systemd-detect-virt
+	chmod +x "$CHROOT_ROOT"/usr/bin/systemd-detect-virt
+}
+
+undivert_grub() {
+	CHROOT_ROOT="$1"
+
+	chroot "$CHROOT_ROOT" rm /usr/sbin/grub-probe
+	chroot "$CHROOT_ROOT" dpkg-divert --remove --local \
+		--rename /usr/sbin/grub-probe
+
+	chroot "$CHROOT_ROOT" dpkg-divert --remove --local \
+		--divert /etc/grub.d/30_os-prober.dpkg-divert \
+		--rename /etc/grub.d/30_os-prober
+
+	if grep -q "^exit 1$" "$CHROOT_ROOT"/usr/bin/systemd-detect-virt; then
+		rm "$CHROOT_ROOT"/usr/bin/systemd-detect-virt
+	fi
+	chroot "$CHROOT_ROOT" dpkg-divert --remove --local \
+		--rename /usr/bin/systemd-detect-virt
+}
+
+recreate_initramfs() {
+	# Regenerate the initramfs by running update-initramfs in the
+	# chroot at $1 and copying the generated initramfs
+	# around. Beware that this was written for a single use case
+	# (live-server) and may not work in all cases without
+	# tweaking...
+	# config/common must be sourced before calling this function.
+	CHROOT="$1"
+	# Start by cargo culting bits of lb_chroot_hacks:
+	if [ -n "$LB_INITRAMFS_COMPRESSION" ]; then
+		echo "COMPRESS=$LB_INITRAMFS_COMPRESSION" > "$CHROOT"/etc/initramfs-tools/conf.d/livecd-rootfs.conf
+	fi
+	chroot "$CHROOT" sh -c "${UPDATE_INITRAMFS_OPTIONS:-} update-initramfs -k all -t -u"
+	rm -rf "$CHROOT"/etc/initramfs-tools/conf.d/livecd-rootfs.conf
+	# Then bits of lb_binary_linux-image:
+	case "${LB_INITRAMFS}" in
+		casper)
+			DESTDIR="binary/casper"
+			;;
+
+		live-boot)
+			DESTDIR="binary/live"
+			;;
+
+		*)
+			DESTDIR="binary/boot"
+			;;
+	esac
+	mv "$CHROOT"/boot/initrd.img-* $DESTDIR
+}
+
+release_ver() {
+    # Return the release version number
+    distro-info --series="$LB_DISTRIBUTION" -r | awk '{ print $1 }'
+}
+
+_snap_post_process() {
+    # Look for the 'core' snap. If it is not present, assume that the image
+    # contains only snaps with bases >= core18. In that case snapd is
+    # preseeded. However, when 'core' is being installed and snapd has not
+    # been installed by a call to 'snap_preseed' (see below) then it is
+    # removed again.
+    local CHROOT_ROOT=$1
+    local SNAP_NAME=$2
+
+    local seed_dir="$CHROOT_ROOT/var/lib/snapd/seed"
+    local snaps_dir="$seed_dir/snaps"
+    local seed_yaml="$seed_dir/seed.yaml"
+    local assertions_dir="$seed_dir/assertions"
+    local snapd_install_stamp="$seed_dir/.snapd-explicit-install-stamp"
+
+    case $SNAP_NAME in
+        core[0-9]*)
+            # If the 'core' snap is not present, assume we are coreXX-only and
+            # install the snapd snap.
+            if [ ! -f ${snaps_dir}/core_[0-9]*.snap ]; then
+                _snap_preseed $CHROOT_ROOT snapd stable
+            fi
+            ;;
+        core)
+            # If the snapd snap has been seeded, but not marked as explicitly
+            # installed (see snap_preseed below), then remove it.
+            if [ -f ${snaps_dir}/snapd_[0-9]*.snap ] && \
+                    [ ! -f "$snapd_install_stamp" ]
+            then
+                # Remove snap, assertions and entry in seed.yaml
+                rm -f ${snaps_dir}/snapd_[0-9]*.snap
+                rm -f ${assertions_dir}/snapd_[0-9]*.assert
+                sed -i -e'N;/name: snapd/,+2d' $seed_yaml
+            fi
+            ;;
+        *)
+            # ignore
+            ;;
+    esac
+}
+
+_snap_preseed() {
+    # Download the snap/assertion and add to the preseed
+    local CHROOT_ROOT=$1
+    local SNAP=$2
+    local SNAP_NAME=${SNAP%/*}
+    local CHANNEL=${3:?Snap channel must be specified}
+
+    local seed_dir="$CHROOT_ROOT/var/lib/snapd/seed"
+    local snaps_dir="$seed_dir/snaps"
+    local seed_yaml="$seed_dir/seed.yaml"
+    local assertions_dir="$seed_dir/assertions"
+
+    # Download the snap & assertion
+    local snap_download_failed=0
+
+    # Preseed a snap only once
+    if [ -f ${snaps_dir}/${SNAP_NAME}_[0-9]*.snap ]; then
+        return
+    fi
+
+    sh -c "
+        set -x;
+        cd \"$CHROOT_ROOT/var/lib/snapd/seed\";
+        SNAPPY_STORE_NO_CDN=1 snap download \
+            --cohort="${COHORT_KEY:-}" \
+            --channel=\"$CHANNEL\" \"$SNAP_NAME\"" || snap_download_failed=1
+    if [ $snap_download_failed = 1 ] ; then
+        echo "If the channel ($CHANNEL) includes '*/ubuntu-##.##' track per "
+        echo "Ubuntu policy (ex. stable/ubuntu-18.04) the publisher will need "
+        echo "to temporarily create the channel/track to allow fallback during"
+        echo "download (ex. stable/ubuntu-18.04 falls back to stable if the"
+        echo "prior had been created in the past)."
+        exit 1
+    fi
+
+    mv -v $seed_dir/*.assert $assertions_dir
+    mv -v $seed_dir/*.snap $snaps_dir
+
+    # Pre-seed snap's base
+    local core_snap=""
+    case $SNAP_NAME in
+        snapd)
+            # snapd is self-contained, ignore base
+            ;;
+        core|core[0-9][0-9])
+            # core and core## are self-contained, ignore base
+            ;;
+        *)
+            # Determine which core snap is needed
+            local snap_info
+
+            # snap info doesn't have --channel, so must run agains the downloaded snap
+            snap_info=$(snap info --verbose ${snaps_dir}/${SNAP_NAME}_[0-9]*.snap)
+
+            if [ $? -ne 0 ]; then
+                echo "Failed to retrieve base of $SNAP_NAME!"
+                exit 1
+            fi
+
+            core_snap=$(echo "$snap_info" | grep '^base:' | awk '{print $2}')
+
+            # If snap info does not list a base use 'core'
+            core_snap=${core_snap:-core}
+
+            _snap_preseed $CHROOT_ROOT $core_snap stable
+            ;;
+    esac
+
+    # Add the snap to the seed.yaml
+    ! [ -e $seed_yaml ] && echo "snaps:" > $seed_yaml
+    cat <<EOF >> $seed_yaml
+  -
+    name: ${SNAP_NAME}
+    channel: ${CHANNEL}
+EOF
+
+    case ${SNAP} in */classic) echo "    classic: true" >> $seed_yaml;; esac
+
+    echo -n "    file: " >> $seed_yaml
+    (cd $snaps_dir; ls -1 ${SNAP_NAME}_*.snap) >> $seed_yaml
+
+    _snap_post_process $CHROOT_ROOT $SNAP_NAME
+}
+
+snap_prepare_assertions() {
+    # Configure basic snapd assertions
+    local CHROOT_ROOT=$1
+    # A colon-separated string of brand:model to be used for the image's model
+    # assertion
+    local CUSTOM_BRAND_MODEL=$2
+
+    local seed_dir="$CHROOT_ROOT/var/lib/snapd/seed"
+    local snaps_dir="$seed_dir/snaps"
+    local assertions_dir="$seed_dir/assertions"
+    local model_assertion="$assertions_dir/model"
+    local account_key_assertion="$assertions_dir/account-key"
+    local account_assertion="$assertions_dir/account"
+
+    mkdir -p "$assertions_dir"
+    mkdir -p "$snaps_dir"
+
+    local brand="$(echo $CUSTOM_BRAND_MODEL | cut -d: -f 1)"
+    local model="$(echo $CUSTOM_BRAND_MODEL | cut -d: -f 2)"
+
+    if ! [ -e "$model_assertion" ] ; then
+        snap known --remote model series=16 \
+            model=$model brand-id=$brand \
+            > "$model_assertion"
+    fi
+
+    if ! [ -e "$account_key_assertion" ] ; then
+        local account_key=$(sed -n -e's/sign-key-sha3-384: //p' \
+            < "$model_assertion")
+        snap known --remote account-key \
+            public-key-sha3-384="$account_key" \
+            > "$account_key_assertion"
+    fi
+
+
+    if ! [ -e "$account_assertion" ] ; then
+        local account=$(sed -n -e's/account-id: //p' < "$account_key_assertion")
+        snap known --remote account account-id=$account \
+            > "$account_assertion"
+    fi
+}
+
+snap_prepare() {
+    # Configure basic snapd assertions and pre-seeds the 'core' snap
+    local CHROOT_ROOT=$1
+    # Optional. If set, should be a colon-separated string of brand:model to be
+    # used for the image's model assertion
+    local CUSTOM_BRAND_MODEL=${2:-generic:generic-classic}
+
+    local seed_dir="$CHROOT_ROOT/var/lib/snapd/seed"
+    local snaps_dir="$seed_dir/snaps"
+
+    snap_prepare_assertions "$CHROOT_ROOT" "$CUSTOM_BRAND_MODEL"
+}
+
+snap_preseed() {
+    # Preseed a snap in the image
+    local CHROOT_ROOT=$1
+    local SNAP=$2
+    local SNAP_NAME=${SNAP%/*}
+    # Per Ubuntu policy, all seeded snaps (with the exception of the core
+    # snap) must pull from stable/ubuntu-$(release_ver) as their channel.
+    local CHANNEL=${3:-"stable/ubuntu-$(release_ver)"}
+
+    snap_prepare $CHROOT_ROOT
+
+    _snap_preseed $CHROOT_ROOT $SNAP $CHANNEL
+
+    # Mark this image as having snapd installed explicitly.
+    case $SNAP_NAME in
+        snapd)
+            touch "$CHROOT_ROOT/var/lib/snapd/seed/.snapd-explicit-install-stamp"
+            ;;
+    esac
+
+
+    # Do basic validation of generated snapd seed.yaml, doing it here
+    # means we catch all the places(tm) that snaps are added but the
+    # downside is that each time a snap is added the seed must be valid,
+    # i.e. snaps with bases need to add bases first etc.
+    if [ -e chroot/var/lib/snapd/seed/seed.yaml ]; then
+        snap debug validate-seed "$CHROOT_ROOT/var/lib/snapd/seed/seed.yaml"
+    fi
+}
+
+configure_oci() {
+    # configure a chroot to be a OCI/docker container
+    # theses changes are taken from the current Dockerfile modifications done
+    # at https://github.com/tianon/docker-brew-ubuntu-core/blob/master/update.sh
+
+    local chroot=$1
+    local serial=$2
+
+    if [ ! -d "${chroot}" ]; then
+        echo "The chroot does not exist"
+        exit 1
+    fi
+
+    echo "==== Configuring OCI ===="
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L40-L48
+    echo '#!/bin/sh' > ${chroot}/usr/sbin/policy-rc.d
+    echo 'exit 101' >> ${chroot}/usr/sbin/policy-rc.d
+    Chroot ${chroot} "chmod +x /usr/sbin/policy-rc.d"
+
+
+    # Inject a build stamp into the image 
+    
+    mkdir -p ${chroot}/etc/cloud
+    cat > ${chroot}/etc/cloud/build.info << EOF
+serial: $serial
+EOF
+
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L54-L56
+    Chroot ${chroot} "dpkg-divert --local --rename --add /sbin/initctl"
+    cp -a ${chroot}/usr/sbin/policy-rc.d ${chroot}/sbin/initctl
+    sed -i 's/^exit.*/exit 0/' ${chroot}/sbin/initctl
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L71-L78
+    echo 'force-unsafe-io' > ${chroot}/etc/dpkg/dpkg.cfg.d/docker-apt-speedup
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L85-L105
+    echo 'DPkg::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' > ${chroot}/etc/apt/apt.conf.d/docker-clean
+
+    echo 'APT::Update::Post-Invoke { "rm -f /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*.deb /var/cache/apt/*.bin || true"; };' >> ${chroot}/etc/apt/apt.conf.d/docker-clean
+
+    echo 'Dir::Cache::pkgcache ""; Dir::Cache::srcpkgcache "";' >> ${chroot}/etc/apt/apt.conf.d/docker-clean
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L109-L115
+    echo 'Acquire::Languages "none";' > ${chroot}/etc/apt/apt.conf.d/docker-no-languages
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L118-L130
+    echo 'Acquire::GzipIndexes "true"; Acquire::CompressionTypes::Order:: "gz";' > ${chroot}/etc/apt/apt.conf.d/docker-gzip-indexes
+
+    # https://github.com/docker/docker/blob/9a9fc01af8fb5d98b8eec0740716226fadb3735c/contrib/mkimage/debootstrap#L134-L151
+    echo 'Apt::AutoRemove::SuggestsImportant "false";' > ${chroot}/etc/apt/apt.conf.d/docker-autoremove-suggests
+
+    # delete all the apt list files since they're big and get stale quickly
+    rm -rf ${chroot}/var/lib/apt/lists/*
+
+    # verify that the APT lists files do not exist
+    Chroot chroot "apt-get indextargets" > indextargets.out
+    [ ! -s indextargets.out ]
+    rm indextargets.out
+    # (see https://bugs.launchpad.net/cloud-images/+bug/1699913)
+
+    # make systemd-detect-virt return "docker"
+    # See: https://github.com/systemd/systemd/blob/aa0c34279ee40bce2f9681b496922dedbadfca19/src/basic/virt.c#L434
+    mkdir -p ${chroot}/run/systemd
+    echo 'docker' > ${chroot}/run/systemd/container
+
+    rm -rf ${chroot}/var/cache/apt/*.bin
+    echo "==== Configuring OCI done ===="
+}
+
+is_live_layer () {
+    local pass=$1
+    for livepass in $LIVE_PASSES; do
+	    [ "$livepass" != "$pass" ] && continue
+        return 0
+    done
+    return 1
+}
