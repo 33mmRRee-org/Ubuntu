@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "distribution": "Ubuntu",
+  "upstream": "https://git.launchpad.net/livecd-rootfs",
+  "ref": "ubuntu/focal",
+  "revision": "6649be693c3b51a036fc4c15fb60cca691698e6a"
+}
