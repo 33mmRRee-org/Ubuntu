@@ -1,0 +1,43 @@
+[
+  {
+    "version": "18.04",
+    "branch": "ubuntu/bionic",
+    "bootstrap": "docker.io/library/ubuntu:18.04",
+    "aliases": [
+      "bionic"
+    ]
+  },
+  {
+    "version": "20.04",
+    "branch": "ubuntu/focal",
+    "bootstrap": "docker.io/library/ubuntu:20.04",
+    "aliases": [
+      "focal"
+    ]
+  },
+  {
+    "version": "22.04",
+    "branch": "ubuntu/jammy",
+    "bootstrap": "docker.io/library/ubuntu:22.04",
+    "aliases": [
+      "jammy"
+    ]
+  },
+  {
+    "version": "24.04",
+    "branch": "ubuntu/noble",
+    "bootstrap": "docker.io/library/ubuntu:24.04",
+    "aliases": [
+      "noble"
+    ]
+  },
+  {
+    "version": "26.04",
+    "branch": "ubuntu/resolute",
+    "bootstrap": "docker.io/library/ubuntu:26.04",
+    "aliases": [
+      "resolute",
+      "latest"
+    ]
+  }
+]
