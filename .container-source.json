@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "distribution": "Ubuntu",
+  "upstream": "https://git.launchpad.net/livecd-rootfs",
+  "ref": "ubuntu/master",
+  "revision": "fc26b7f821e1d897a322240d57a34ef01c2749f2"
+}
